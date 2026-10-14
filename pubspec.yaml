@@ -15,6 +15,9 @@ dependencies:
   photo_manager: ^3.6.4
   path_provider: ^2.1.5
   path: ^1.9.1
+  image: ^4.5.4
+  video_player: ^2.9.5
+  ffmpeg_kit_flutter_new: ^4.6.7
 
 dev_dependencies:
   flutter_test:

@@ -44,6 +44,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
               onChanged: (v) => update(settings.copyWith(askBeforeSaving: v)),
             ),
             const Divider(),
+            const _Header('저장 옵션'),
+            SwitchListTile(
+              title: const Text('필터 + 원본 동시 저장'),
+              subtitle: const Text('켜면 필터 적용본과 원본을 각각 저장합니다. Original은 1개만 저장합니다. 동영상은 필터 인코딩 후 저장되므로 시간이 걸릴 수 있습니다.'),
+              value: settings.saveOriginalAlongsideFilter,
+              onChanged: (v) => update(settings.copyWith(saveOriginalAlongsideFilter: v)),
+            ),
+            const Divider(),
             const _Header('촬영 화면'),
             SwitchListTile(
               title: const Text('3분할 그리드'),
