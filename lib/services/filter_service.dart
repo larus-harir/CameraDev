@@ -6,24 +6,25 @@ import '../models/filter_preset.dart';
 
 class FilterService {
   Future<Uint8List> processCapture(Uint8List jpeg, String ratio,
-      FilterPreset preset, double strength) => compute(_processJpeg, <Object>[
-    jpeg, ratio, CameraFilters.mixedMatrix(preset,strength), preset, strength,
+      FilterPreset preset, double strength, {Uint8List? frameArtwork}) => compute(_processJpeg, <Object?>[
+    jpeg, ratio, CameraFilters.mixedMatrix(preset,strength), preset, strength, frameArtwork,
   ]);
 
   Future<Uint8List> apply(Uint8List jpeg, FilterPreset preset, double strength) {
     if (preset.id == 'original' || strength <= 0) return Future.value(jpeg);
-    return compute(_processJpeg, <Object>[
-      jpeg, '', CameraFilters.mixedMatrix(preset,strength), preset, strength,
+    return compute(_processJpeg, <Object?>[
+      jpeg, '', CameraFilters.mixedMatrix(preset,strength), preset, strength, null,
     ]);
   }
 }
 
-Uint8List _processJpeg(List<Object> args) {
+Uint8List _processJpeg(List<Object?> args) {
   final source=args[0] as Uint8List;
   final ratioName=args[1] as String;
   final matrix=args[2] as List<double>;
   final preset=args[3] as FilterPreset;
   final strength=(args[4] as double).clamp(0.0,1.0);
+  final frameArtwork=args[5] as Uint8List?;
   final filtered=preset.id!='original' && strength>0;
   final decoded=img.decodeImage(source);
   if(decoded==null) throw StateError('이미지 파일을 읽을 수 없습니다.');
@@ -41,7 +42,7 @@ Uint8List _processJpeg(List<Object> args) {
       image=img.copyCrop(image,x:(image.width-width)~/2,y:(image.height-height)~/2,width:width,height:height);
     }
   }
-  if(!filtered && !needsCrop && decoded.exif.imageIfd.orientation==null){return source;}
+  if(!filtered && !needsCrop && frameArtwork == null && decoded.exif.imageIfd.orientation==null){return source;}
   if(filtered){
     final highlights=preset.highlights.clamp(-100,100)*strength/100;
     final shadows=preset.shadows.clamp(-100,100)*strength/100;
@@ -57,7 +58,7 @@ Uint8List _processJpeg(List<Object> args) {
     // A lightweight local-contrast approximation: sample a downscaled blurred
     // luminance field. Avoid full-resolution multi-pass convolution.
     final localAmount=(texture*0.4+clarity*0.6).clamp(-1.0,1.0);
-    final small=localAmount.abs()>0.001 ? img.copyResize(image,width:math.max(1,(w/24).round())) : null;
+    final small=localAmount.abs()>0.001 ? img.copyResize(image,width:math.max(1,(w/24).round()).toInt()) : null;
     final rng=math.Random(9417);
     for(var y=0;y<h;y++){
       for(var x=0;x<w;x++){
@@ -85,8 +86,8 @@ Uint8List _processJpeg(List<Object> args) {
           nr=128+(nr-128)*factor;ng=128+(ng-128)*factor;nb=128+(nb-128)*factor;
         }
         if(small!=null){
-          final sample=small.getPixel(math.min(small.width-1,x*small.width~/w),
-            math.min(small.height-1,y*small.height~/h));
+          final sample=small.getPixel(math.min(small.width-1,x*small.width~/w).toInt(),
+            math.min(small.height-1,y*small.height~/h).toInt());
           final local=(r*.2126+g*.7152+b*.0722)-
             (sample.r*.2126+sample.g*.7152+sample.b*.0722);
           final boost=local*localAmount*0.6;
@@ -107,6 +108,14 @@ Uint8List _processJpeg(List<Object> args) {
         pixel.b=nb.clamp(0,255).round();
       }
     }
+  }
+  if (frameArtwork != null) {
+    final overlay = img.decodePng(frameArtwork);
+    if (overlay == null) throw StateError('프레임 이미지 디코딩 실패');
+    final resized = img.copyResize(overlay,
+        width: image.width, height: image.height,
+        interpolation: img.Interpolation.linear);
+    img.compositeImage(image, resized);
   }
   return Uint8List.fromList(img.encodeJpg(image,quality:95));
 }

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
 import 'package:ffmpeg_kit_flutter_new/return_code.dart';
 import 'package:path/path.dart' as p;
@@ -9,11 +10,11 @@ import '../models/filter_preset.dart';
 /// FFmpeg color filters are not pixel-identical to the photo engine.
 class VideoFilterService {
   Future<String> render(String input, FilterPreset preset, double strength,
-      {String ratio = '16:9', bool portrait = true}) async {
+      {String ratio = '16:9', bool portrait = true, Uint8List? frameArtwork}) async {
     final hasColorFilter = preset.id != 'original' && strength > 0;
     // CameraX's default video output is 16:9. Avoid transcoding untouched
     // recordings in the common Original + 16:9 case.
-    if (!hasColorFilter && ratio == '16:9') return input;
+    if (!hasColorFilter && ratio == '16:9' && frameArtwork == null) return input;
     final amount = strength.clamp(0.0, 1.0);
     final dir = await getTemporaryDirectory();
     final output = p.join(dir.path, 'export_${DateTime.now().microsecondsSinceEpoch}.mp4');
@@ -53,15 +54,32 @@ class VideoFilterService {
         'force_original_aspect_ratio=decrease:force_divisible_by=2');
     final vf = filters.join(',');
     String quote(String value) => '"${value.replaceAll('"', '\\"')}"';
-    final command = '-hide_banner -loglevel error -y -i ${quote(input)} '
-        '-vf ${quote(vf)} -map 0:v:0 -map 0:a? -c:v libx264 -preset veryfast '
-        '-crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ${quote(output)}';
-    final session = await FFmpegKit.execute(command);
-    final result = await session.getReturnCode();
-    if (!ReturnCode.isSuccess(result) || !await File(output).exists()) {
-      final logs = await session.getOutput();
-      throw StateError('동영상 필터 처리 실패: $logs');
+    String? overlayPath;
+    if (frameArtwork != null) {
+      overlayPath = p.join(dir.path, 'frame_${DateTime.now().microsecondsSinceEpoch}.png');
+      await File(overlayPath).writeAsBytes(frameArtwork, flush: true);
     }
-    return output;
+    final command = overlayPath == null
+        ? '-hide_banner -loglevel error -y -i ${quote(input)} '
+          '-vf ${quote(vf)} -map 0:v:0 -map 0:a? -c:v libx264 -preset veryfast '
+          '-crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ${quote(output)}'
+        : '-hide_banner -loglevel error -y -i ${quote(input)} -loop 1 -i ${quote(overlayPath)} '
+          '-filter_complex ${quote('[0:v]$vf[base];[1:v][base]scale2ref=w=main_w:h=main_h[ov][scaled];'
+              '[scaled][ov]overlay=x=0:y=0:shortest=1,format=yuv420p[out]')} '
+          '-map [out] -map 0:a? -c:v libx264 -preset veryfast '
+          '-crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ${quote(output)}';
+    try {
+      final session = await FFmpegKit.execute(command);
+      final result = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(result) || !await File(output).exists()) {
+        final logs = await session.getOutput();
+        throw StateError('동영상 필터/프레임 처리 실패: $logs');
+      }
+      return output;
+    } finally {
+      if (overlayPath != null) {
+        try { await File(overlayPath).delete(); } catch (_) {}
+      }
+    }
   }
 }

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../filters/my_presets.dart';
+import '../filters/digital_profiles.dart';
 
 /// Lightroom-inspired settings. Values approximate Lightroom, not identical.
 class FilterPreset {
@@ -20,8 +21,16 @@ class CameraFilters {
     1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0,
   ];
   static const presets = myCameraPresets;
-  static FilterPreset byId(String id) => presets.firstWhere(
-    (f) => f.id == id, orElse: () => presets.first);
+  static const digitalPresets = digitalCameraProfiles;
+  static FilterPreset byId(String id) {
+    for (final preset in digitalPresets) {
+      if (preset.id == id) return preset;
+    }
+    for (final preset in presets) {
+      if (preset.id == id) return preset;
+    }
+    return presets.first;
+  }
 
   /// Fast GPU preview approximation. Selective tonal and spatial effects are
   /// rendered on exported JPEG only; preview is therefore not pixel-identical.
