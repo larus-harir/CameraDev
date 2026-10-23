@@ -1,16 +1,23 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import '../models/camera_settings.dart';
 import '../models/camera_style.dart';
 import '../widgets/camera_chrome.dart';
 import '../widgets/frame_artwork.dart';
+import '../widgets/zoom_dial.dart';
+import '../widgets/focus_indicator.dart';
 import '../models/filter_preset.dart';
 import '../services/filter_service.dart';
 import '../services/video_filter_service.dart';
 import '../services/camera_service.dart';
+import '../services/lens_catalog.dart';
 import '../services/photo_storage_service.dart';
 import '../services/settings_service.dart';
 import '../widgets/grid_overlay.dart';
@@ -39,7 +46,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   bool _recordDualSave = false;
   CameraStyle _style = CameraStyle.digital;
   String _digitalId = 'digital_s';
-  String _filmId = 'original';
+  String _filmId = 'preset_01';
   double _digitalStrength = 1;
   double _filmStrength = 1;
   bool _advancedVisible = false;
@@ -77,7 +84,11 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   bool _savingPreview = false;
   Uint8List? _captured;
   double _zoom = 1, _minZoom = 1, _maxZoom = 1;
-  bool _zoomSliderVisible = false;
+  bool _zoomApplying = false;
+  double? _zoomTarget;
+  Timer? _zoomFlushTimer;
+  DateTime _lastZoomCommand = DateTime.fromMillisecondsSinceEpoch(0);
+  int _zoomCommandDurationMs = 0;
   bool _timerCancelled = false;
   FlashMode _flash = FlashMode.off;
   int _timer = 0, _countdown = 0;
@@ -85,6 +96,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String _videoRatio = '16:9';
   String get _ratio => _videoMode ? _videoRatio : _photoRatio;
   Offset? _focusPoint;
+  bool _focusVisible = false;
+  Timer? _focusHideTimer;
   int _focusToken = 0;
 
   @override
@@ -111,7 +124,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       _digitalId = CameraFilters.digitalPresets.any((p) => p.id == look.digitalId)
           ? look.digitalId : 'digital_s';
       _filmId = CameraFilters.presets.any((p) => p.id == look.filmId)
-          ? look.filmId : 'original';
+          ? look.filmId : 'preset_01';
       _digitalStrength = look.digitalStrength;
       _filmStrength = look.filmStrength;
       _filterId = _style == CameraStyle.digital ? _digitalId : _filmId;
@@ -140,10 +153,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   void _syncZoom() {
-    _minZoom = _camera.minZoom;
-    _maxZoom = _camera.maxZoom;
-    _zoom = 1.0.clamp(_minZoom, _maxZoom).toDouble();
-    _zoomSliderVisible = false;
+    _zoomFlushTimer?.cancel();
+    _zoomTarget = null;
+    _zoomCommandDurationMs = 0;
+    final optical = _camera.opticalFactor;
+    _minZoom = _camera.minZoom * optical;
+    _maxZoom = math.min(30.0, _camera.maxZoom * optical);
+    _zoom = optical.clamp(_minZoom, _maxZoom).toDouble();
   }
 
   @override
@@ -184,6 +200,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     ++_cameraEpoch;
     WidgetsBinding.instance.removeObserver(this);
     _recordingTicker?.cancel();
+    _zoomFlushTimer?.cancel();
+    _focusHideTimer?.cancel();
     if (_lookSaveDebounce?.isActive ?? false) {
       _lookSaveDebounce?.cancel();
       _saveLook(immediate: true);
@@ -258,6 +276,18 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   }
 
   int _pendingSaves = 0;
+  // One photo-processing isolate at a time avoids memory pressure and CPU
+  // contention from decoding several multi-megapixel JPEGs simultaneously.
+  // The shutter stays available while queued photos finish in the background.
+  Future<void> _photoSaveQueue = Future<void>.value();
+
+  void _queuePhotoSave(String path, String ratio, FilterPreset preset,
+      double strength, bool dualSave,
+      Future<Uint8List> Function()? renderFrame, bool frame) {
+    _photoSaveQueue = _photoSaveQueue.then((_) => _processAndSave(
+        path, ratio, preset, strength, dualSave, renderFrame, frame));
+  }
+
 
   Future<void> _capture() async {
     if (_busy || !_ready || _cameraTransition || _videoMode || _recordingBusy) return;
@@ -266,7 +296,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       return;
     }
     _timerCancelled = false;
-    setState(() { _busy = true; _countdown = _timer; _zoomSliderVisible = false; _advancedVisible = false; });
+    setState(() { _busy = true; _countdown = _timer; _advancedVisible = false; });
     try {
       for (int remaining = _timer; remaining > 0; remaining--) {
         await Future.delayed(const Duration(seconds: 1));
@@ -281,36 +311,41 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       final ask = _settings.askBeforeSaving;
       final dualSave = _settings.saveOriginalAlongsideFilter && preset.id != 'original' && strength > 0;
       final style = _style;
-      final frame = style == CameraStyle.film
-          ? _settings.addFilmFrameToExports
-          : _settings.addDigitalFrameToExports;
+      // CH.4 v8: keep the frame-export option and rendering pipeline for
+      // future design work, but export no decorative frame for now.
+      const frame = false;
       final shotFrame = _filmFrameCounter;
       final shotZoom = _zoom;
       final shotDate = DateTime.now();
       final portrait = MediaQuery.orientationOf(context) == Orientation.portrait;
+      final shotTimer = Stopwatch()..start();
       final photo = await _camera.takePicture();
+      debugPrint('[CameraPerf] camera.takePicture: '
+          '${shotTimer.elapsedMilliseconds} ms');
       if (style == CameraStyle.film) {
         _filmFrameCounter = _filmFrameCounter >= 9999 ? 1 : _filmFrameCounter + 1;
         unawaited(_settingsService.saveFilmCounter(_filmFrameCounter));
       }
       // Auto-save: camera is usable again immediately after capture.
       // JPEG processing and gallery I/O continue asynchronously.
-      final frameLayer = frame
-          ? renderFrameArtworkPng(
+      // Defer expensive PNG frame rasterization and JPEG file reading until
+      // the queued save starts, rather than holding up the next shutter press.
+      Future<Uint8List> Function()? renderFrame = frame
+          ? () => renderFrameArtworkPng(
               style: style, look: preset.label, ratio: ratio,
               zoom: shotZoom, frameNumber: shotFrame, date: shotDate,
               portrait: portrait)
           : null;
       if (!showPreview && !ask) {
         setState(() => _pendingSaves++);
-        unawaited(_processAndSave(photo.readAsBytes(), ratio, preset,
-          strength, dualSave, frameLayer, frame));
+        _queuePhotoSave(photo.path, ratio, preset,
+            strength, dualSave, renderFrame, frame);
         return;
       }
       final rawBytes = await photo.readAsBytes();
       final bytes = await _filterService.processCapture(
           rawBytes, ratio, preset, strength,
-          frameArtwork: frameLayer == null ? null : await frameLayer);
+          frameArtwork: renderFrame == null ? null : await renderFrame());
       _capturedOriginal = dualSave ? rawBytes : null;
       _capturedRatio = ratio;
       _capturedDualSave = dualSave;
@@ -341,19 +376,25 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  Future<void> _processAndSave(Future<Uint8List> readBytes,
+  Future<void> _processAndSave(String photoPath,
       String ratio, FilterPreset preset, double strength, bool dualSave,
-      Future<Uint8List>? frameLayer, bool frame) async {
+      Future<Uint8List> Function()? renderFrame, bool frame) async {
+    final elapsed = Stopwatch()..start();
     try {
-      final original = await readBytes;
+      final original = await File(photoPath).readAsBytes();
       final bytes = await _filterService.processCapture(
           original, ratio, preset, strength,
-          frameArtwork: frameLayer == null ? null : await frameLayer);
+          frameArtwork: renderFrame == null ? null : await renderFrame());
+      final editMs = elapsed.elapsedMilliseconds;
       await _savePair(bytes, dualSave ? original : null, ratio, preset.id, frame: frame);
+      debugPrint('[CameraPerf] photo edit=$editMs ms, gallery='
+          '${elapsed.elapsedMilliseconds - editMs} ms');
       // No modal snackbar for every shot: the saving indicator vanishes when done.
     } catch (e) {
       _message('사진 저장 실패: $e');
     } finally {
+      debugPrint('[CameraPerf] photo processed + gallery save: '
+          '${elapsed.elapsedMilliseconds} ms');
       if (mounted) {
         setState(() { if (_pendingSaves > 0) _pendingSaves--; });
       } else if (_pendingSaves > 0) {
@@ -389,26 +430,49 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
-  Future<void> _tapToFocus(TapDownDetails details, Size viewSize) async {
-    if (_busy || !_ready || viewSize.width == 0 || viewSize.height == 0) return;
+  Future<void> _tapToFocus(TapDownDetails details, Size viewSize,
+      double sourceAspectRatio) async {
+    if (!_ready || _cameraTransition || _background ||
+        viewSize.width <= 0 || viewSize.height <= 0) return;
     final local = details.localPosition;
-    final x = (local.dx / viewSize.width).clamp(0.0, 1.0);
-    final y = (local.dy / viewSize.height).clamp(0.0, 1.0);
     final token = ++_focusToken;
-    setState(() => _focusPoint = Offset(local.dx, local.dy));
+    _focusHideTimer?.cancel();
+    // Display feedback immediately; do not wait for Android's focus command.
+    setState(() {
+      _focusPoint = local;
+      _focusVisible = true;
+    });
+    _focusHideTimer = Timer(const Duration(milliseconds: 1100), () {
+      if (mounted && token == _focusToken) {
+        setState(() => _focusVisible = false);
+      }
+    });
+
+    // CameraPreview uses BoxFit.cover. Match its center crop when mapping a
+    // user's visible tap back to camera plugin's normalized focus coordinates.
+    const sourceHeight = 1000.0;
+    final sourceWidth = sourceAspectRatio * sourceHeight;
+    final scale = math.max(viewSize.width / sourceWidth,
+        viewSize.height / sourceHeight);
+    final fittedWidth = sourceWidth * scale;
+    final fittedHeight = sourceHeight * scale;
+    final x = ((local.dx + (fittedWidth - viewSize.width) / 2) / fittedWidth)
+        .clamp(0.0, 1.0).toDouble();
+    final y = ((local.dy + (fittedHeight - viewSize.height) / 2) / fittedHeight)
+        .clamp(0.0, 1.0).toDouble();
     try {
-      final result = await _camera.focusAt(x, y);
-      if (!result) _message('이 렌즈에서는 터치 초점 위치를 지원하지 않을 수 있습니다.');
+      final supported = await _camera.focusAt(x, y);
+      if (!supported && mounted && token == _focusToken) {
+        _message('현재 렌즈에서 터치 초점 설정을 지원하지 않습니다.');
+      }
     } catch (e) {
-      _message('초점 설정 실패: $e');
+      if (mounted && token == _focusToken) _message('초점 설정 실패: $e');
     }
-    await Future.delayed(const Duration(milliseconds: 900));
-    if (mounted && token == _focusToken) setState(() => _focusPoint = null);
   }
 
   Widget _viewfinder(CameraController controller) {
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
       child: LayoutBuilder(builder: (context, constraints) {
       final portrait = constraints.maxHeight >= constraints.maxWidth;
       final landscapeRatio = _ratio == '1:1' ? 1.0 : _ratio == '16:9' ? 16 / 9 : 4 / 3;
@@ -423,8 +487,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           ? available.width : available.height * targetRatio;
       final frameHeight = frameWidth / targetRatio;
       final cameraRatio = portrait ? 1 / controller.value.aspectRatio : controller.value.aspectRatio;
-      return Center(child: Container(
-        padding: const EdgeInsets.all(4.5),
+      // Pin the viewfinder toward the top when there is spare vertical room;
+      // the lower space becomes an ergonomic thumb zone for the zoom dial.
+      return Align(
+        alignment: portrait ? Alignment.topCenter : Alignment.center,
+        child: Container(
+        padding: const EdgeInsets.all(4),
         decoration: BoxDecoration(
           color: CameraPalette.raised,
           border: Border.all(color: CameraPalette.stroke, width: .85),
@@ -457,32 +525,23 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           if (_settings.showGrid) const IgnorePointer(child: GridOverlay()),
           LayoutBuilder(builder: (context, box) => GestureDetector(
             behavior: HitTestBehavior.translucent,
-            onTapDown: (details) => _tapToFocus(details, Size(box.maxWidth, box.maxHeight)),
+            onTapDown: (details) => _tapToFocus(
+                details, Size(box.maxWidth, box.maxHeight), cameraRatio),
             child: Stack(children: [
               if (_focusPoint != null)
                 Positioned(
-                  left: (_focusPoint!.dx - 26).clamp(0, box.maxWidth - 52),
-                  top: (_focusPoint!.dy - 26).clamp(0, box.maxHeight - 52),
-                  child: const IgnorePointer(child: SizedBox(
-                    width: 52, height: 52,
-                    child: DecoratedBox(decoration: BoxDecoration(
-                      border: Border.fromBorderSide(BorderSide(color: Colors.amber, width: 2)),
-                    )),
-                  )),
-          )]),
+                  left: (_focusPoint!.dx - 27).clamp(
+                      0.0, math.max(0.0, box.maxWidth - 54)).toDouble(),
+                  top: (_focusPoint!.dy - 27).clamp(
+                      0.0, math.max(0.0, box.maxHeight - 54)).toDouble(),
+                  child: CameraFocusIndicator(
+                      sequence: _focusToken, visible: _focusVisible),
+                ),
+            ]),
           )),
-          IgnorePointer(child: CustomPaint(
-            painter: FrameArtworkPainter(
-              style: _recording ? _recordStyle : _style,
-              look: CameraFilters.byId(_recording ? _recordFilterId : _filterId).label,
-              ratio: _ratio,
-              zoom: _recording ? _recordZoom : _zoom,
-              frameNumber: _recording ? _recordFrameNumber : _filmFrameCounter,
-              date: _recording ? _recordDate : DateTime.now(),
-            ),
-          )),
-          Positioned(right: 7, top: 0, bottom: 0,
-            child: Center(child: _zoomRail())),
+          // Decorative frame deliberately removed in v8. This leaves the
+          // full live photograph unobstructed; frame_artwork.dart remains for
+          // a future, separately reviewed design.
         ])),
         ),
       ));
@@ -558,7 +617,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     setState(() {
       _recordingBusy = true;
       _countdown = _timer;
-      _zoomSliderVisible = false;
       _advancedVisible = false;
     });
     try {
@@ -578,9 +636,9 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       _recordZoom = _zoom;
       _recordDate = DateTime.now();
       _recordLook = CameraFilters.byId(_filterId).label;
-      _recordFrameExport = _style == CameraStyle.film
-          ? _settings.addFilmFrameToExports
-          : _settings.addDigitalFrameToExports;
+      // Frame designs are temporarily disabled in preview AND in exports.
+      // The setting and frame rendering pipeline remain in the project.
+      _recordFrameExport = false;
       if (mounted) setState(() => _advancedVisible = false);
       await _camera.startVideo();
       _recordingStarted = DateTime.now();
@@ -638,6 +696,8 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       CameraStyle frameStyle, int frameNumber, double frameZoom,
       DateTime frameDate, String frameLook) async {
     final temporaryFiles = <String>{};
+    final elapsed = Stopwatch()..start();
+    bool successfullyPublished = false;
     if (mounted) setState(() {
       _processingVideos++;
       _videoSaveStatus = '동영상 저장 준비 중';
@@ -683,6 +743,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         await _storage.saveVideoToGallery(result,
           name: '${base}_${frame ? 'FRAME_' : ''}ORIGINAL.mp4');
       }
+      successfullyPublished = true;
     } catch (e) {
       // Never publish an unfiltered clip under a filter name on processing error.
       _message('동영상 처리 실패: $e (원본 임시 파일 확인 필요)');
@@ -690,7 +751,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       for (final filePath in temporaryFiles) {
         try { await File(filePath).delete(); } catch (_) {}
       }
-      // Camera plugin source is retained, to avoid losing a failed recording.
+      // Only remove successfully published camera temp files. Keep failed
+      // recordings so a user can recover them rather than silently lose data.
+      if (successfullyPublished) {
+        try {
+          final temp = await getTemporaryDirectory();
+          if (p.isWithin(temp.path, path)) await File(path).delete();
+        } catch (_) {}
+      }
+      debugPrint('[CameraPerf] video processed + gallery save: '
+          '${elapsed.elapsedMilliseconds} ms');
       if (mounted) setState(() {
         if (_processingVideos > 0) _processingVideos--;
         if (_processingVideos == 0) _videoSaveStatus = null;
@@ -732,113 +802,75 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     ),
   );
 
-  Future<void> _setZoom(double value) async {
+  // Native CameraX zoom can be expensive on some Samsung devices. Keep the
+  // user's drag smoothly local to CameraZoomDial, and send only the most recent
+  // value to the platform (about 7-9 calls/sec at most; fewer if the native
+  // camera is slow). No parent setState while dragging or settling.
+  void _setZoom(double value) {
+    if (!_ready || _cameraTransition || _background) return;
     final target = value.clamp(_minZoom, _maxZoom).toDouble();
-    if (mounted) setState(() => _zoom = target);
+    if ((target - _zoom).abs() < .012) return;
+    _zoom = target;
+    _zoomTarget = target;
+    _scheduleZoom();
+  }
+
+  void _scheduleZoom({bool force = false}) {
+    if (_zoomApplying || _zoomTarget == null || _pageDisposed ||
+        !_ready || _cameraTransition || _background) return;
+    _zoomFlushTimer?.cancel();
+    // If setZoomLevel was already slow, avoid issuing more native requests
+    // faster than the device can apply them.
+    final intervalMs = math.max(120, _zoomCommandDurationMs + 25);
+    final elapsed = DateTime.now().difference(_lastZoomCommand).inMilliseconds;
+    final waitMs = force ? 0 : math.max(0, intervalMs - elapsed);
+    if (waitMs == 0) {
+      unawaited(_flushZoom());
+    } else {
+      _zoomFlushTimer = Timer(Duration(milliseconds: waitMs),
+          () => unawaited(_flushZoom()));
+    }
+  }
+
+  Future<void> _flushZoom() async {
+    if (_zoomApplying || _zoomTarget == null || _pageDisposed ||
+        !_ready || _cameraTransition || _background) return;
+    final value = _zoomTarget!;
+    _zoomTarget = null;
+    _zoomApplying = true;
+    _lastZoomCommand = DateTime.now();
+    final timer = Stopwatch()..start();
     try {
-      await _camera.setZoom(target);
+      // Displayed magnification is optical FoV ratio * intra-lens zoom.
+      // The Camera2 controller receives the per-lens native zoom factor.
+      await _camera.setZoom(value / _camera.opticalFactor);
     } catch (e) {
-      _message('줌 설정 실패: $e');
-    }
-  }
-
-  // The zoom rail is painted OVER the live viewfinder: never resize preview.
-  Widget _zoomRail() {
-    final stops = <double>[];
-    for (final value in [_minZoom, 0.6, 1.0, 2.0, 3.0, _maxZoom]) {
-      if (value >= _minZoom && value <= _maxZoom &&
-          !stops.any((previous) => (previous - value).abs() < .06)) {
-        stops.add(value);
+      debugPrint('[CameraZoom] native setZoom failed: $e');
+    } finally {
+      _zoomCommandDurationMs = timer.elapsedMilliseconds;
+      if (_zoomCommandDurationMs > 110) {
+        debugPrint('[CameraZoom] native update took ${_zoomCommandDurationMs}ms');
       }
+      _zoomApplying = false;
+      if (_zoomTarget != null) _scheduleZoom();
     }
-    stops.sort();
-
-    if (!_zoomSliderVisible) {
-      return Semantics(
-        button: true, label: '줌 ${_zoom.toStringAsFixed(1)}배, 확대해서 조절',
-        child: InkWell(
-          borderRadius: BorderRadius.circular(24),
-          onTap: () => setState(() => _zoomSliderVisible = true),
-          child: Container(
-            width: 43, height: 43,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              color: CameraPalette.base.withValues(alpha: .78),
-              border: Border.all(color: CameraPalette.stroke),
-              shape: BoxShape.circle,
-            ),
-            child: Text('${_zoom.toStringAsFixed(1)}×',
-              style: const TextStyle(fontSize: 11,
-                color: CameraPalette.cream, fontWeight: FontWeight.w700)),
-          ),
-        ),
-      );
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 8),
-      decoration: BoxDecoration(
-        color: CameraPalette.base.withValues(alpha: .91),
-        border: Border.all(color: CameraPalette.stroke),
-        borderRadius: BorderRadius.circular(25),
-      ),
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 325),
-        child: SingleChildScrollView(child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            for (final stop in stops)
-              InkWell(
-                borderRadius: BorderRadius.circular(20),
-                onTap: () => _setZoom(stop),
-                child: Container(
-                  width: 36, height: 32,
-                  alignment: Alignment.center,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: (_zoom - stop).abs() < .06
-                        ? CameraPalette.brass : Colors.transparent,
-                  ),
-                  child: Text(
-                    '${stop.toStringAsFixed(stop == stop.roundToDouble() ? 0 : 1)}×',
-                    style: TextStyle(fontFamily: 'monospace', fontSize: 10,
-                      color: (_zoom - stop).abs() < .06
-                          ? CameraPalette.base : CameraPalette.cream),
-                  ),
-                ),
-              ),
-            if (_maxZoom > _minZoom) ...[
-              const SizedBox(height: 4),
-              SizedBox(width: 38, height: 100, child: RotatedBox(
-                quarterTurns: 3,
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 2,
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    overlayShape: const RoundSliderOverlayShape(overlayRadius: 11),
-                  ),
-                  child: Slider(
-                    min: _minZoom,
-                    max: _maxZoom,
-                    value: _zoom.clamp(_minZoom, _maxZoom).toDouble(),
-                    activeColor: CameraPalette.brass,
-                    onChanged: _setZoom,
-                  ),
-                ),
-              )),
-            ],
-            IconButton(
-              tooltip: '줌 닫기',
-              onPressed: () => setState(() => _zoomSliderVisible = false),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 35, minHeight: 29),
-              icon: const Icon(Icons.close, color: CameraPalette.muted, size: 17),
-            ),
-          ],
-        )),
-      ),
-    );
   }
+
+  void _zoomSettled() {
+    // Commit the latest zoom even if intermediate commands were coalesced.
+    // IMPORTANT: do not call setState here: rebuilding CameraPreview when a
+    // gesture ends can cause a visible frame hitch on CameraX.
+    _scheduleZoom(force: true);
+  }
+
+  Widget _zoomControl() => CameraZoomDial(
+    key: ValueKey('${_camera.currentLens?.id ?? 'none'}-$_cameraEpoch'),
+    minZoom: _minZoom,
+    maxZoom: _maxZoom,
+    initialZoom: _zoom,
+    onChanged: _setZoom,
+    onSettled: _zoomSettled,
+  );
 
   void _saveLook({bool immediate = false}) {
     _lookSaveDebounce?.cancel();
@@ -922,11 +954,42 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         MaterialPageRoute(builder: (_) => const GalleryScreen()));
   }
 
+  IconData get _flashIcon {
+    if (_videoMode) {
+      return _flash == FlashMode.torch
+          ? Icons.flashlight_on : Icons.flashlight_off;
+    }
+    switch (_flash) {
+      case FlashMode.off:
+        return Icons.flash_off;
+      case FlashMode.auto:
+        return Icons.flash_auto;
+      case FlashMode.always:
+        return Icons.flash_on;
+      case FlashMode.torch:
+        return Icons.flashlight_on;
+    }
+  }
+
+  String get _flashState {
+    if (_videoMode) return _flash == FlashMode.torch ? 'ON' : 'OFF';
+    switch (_flash) {
+      case FlashMode.off:
+        return 'OFF';
+      case FlashMode.auto:
+        return 'AUTO';
+      case FlashMode.always:
+        return 'ON';
+      case FlashMode.torch:
+        return 'TORCH';
+    }
+  }
+
   Widget _topBar({required bool landscape}) {
     final disabled = _recording || _recordingBusy || _cameraTransition || _busy;
     return Container(
-      height: 45,
-      padding: const EdgeInsets.symmetric(horizontal: 7),
+      height: 48,
+      padding: const EdgeInsets.symmetric(horizontal: 5),
       decoration: const BoxDecoration(
         color: CameraPalette.panel,
         border: Border(bottom: BorderSide(color: CameraPalette.stroke, width: .6)),
@@ -935,20 +998,22 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         CameraStyleToggle(style: _style, enabled: !disabled, onSelected: _setStyle),
         const Spacer(),
         if (!landscape) ...[
-          _tinyButton(
-            icon: _flash == FlashMode.off ? Icons.flash_off : Icons.flash_on,
-            tooltip: _videoMode ? '라이트' : '플래시',
+          _statusButton(icon: _flashIcon, label: _flashState,
+            tooltip: _videoMode ? '라이트 $_flashState' : '플래시 $_flashState',
             onPressed: disabled ? null : _cycleFlash,
-          ),
+            active: _flash != FlashMode.off),
+          _statusButton(icon: _timer == 0 ? Icons.timer_off_outlined : Icons.timer_outlined,
+            label: _timer == 0 ? 'OFF' : '${_timer}s',
+            tooltip: _timer == 0 ? '타이머 꺼짐' : '타이머 $_timer초',
+            onPressed: disabled ? null : _cycleTimer,
+            active: _timer > 0),
           InkWell(
-            borderRadius: BorderRadius.circular(7),
+            borderRadius: BorderRadius.circular(8),
             onTap: disabled ? null : _cycleRatio,
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 10),
-              child: Text(_ratio, style: const TextStyle(
+            child: SizedBox(width: 39, height: 42,
+              child: Center(child: Text(_ratio, style: const TextStyle(
                 color: CameraPalette.cream, fontSize: 11,
-                fontFamily: 'monospace', fontWeight: FontWeight.w700)),
-            ),
+                fontFamily: 'monospace', fontWeight: FontWeight.w700)))),
           ),
         ],
         _tinyButton(
@@ -956,7 +1021,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           tooltip: '추가 촬영 설정',
           onPressed: disabled ? null : () => setState(() {
             _advancedVisible = !_advancedVisible;
-            _zoomSliderVisible = false;
           }),
           active: _advancedVisible,
         ),
@@ -964,11 +1028,32 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     );
   }
 
+  Widget _statusButton({required IconData icon, required String label,
+    required String tooltip, required VoidCallback? onPressed,
+    bool active = false}) => Semantics(
+      button: true, label: tooltip,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onPressed,
+        child: SizedBox(width: 39, height: 45, child: Column(
+          mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(icon, size: 19,
+              color: active ? CameraPalette.brass : CameraPalette.cream),
+            const SizedBox(height: 1),
+            Text(label, maxLines: 1, style: TextStyle(
+              fontFamily: 'monospace', fontSize: 8,
+              fontWeight: FontWeight.w700,
+              color: active ? CameraPalette.brass : CameraPalette.muted)),
+          ],
+        )),
+      ),
+    );
+
   Widget _tinyButton({required IconData icon, required String tooltip,
       required VoidCallback? onPressed, bool active = false}) => IconButton(
     tooltip: tooltip,
     visualDensity: VisualDensity.compact,
-    constraints: const BoxConstraints(minHeight: 39, minWidth: 38),
+    constraints: const BoxConstraints(minHeight: 39, minWidth: 37),
     padding: const EdgeInsets.all(6),
     onPressed: onPressed,
     icon: Icon(icon, size: 20,
@@ -988,14 +1073,16 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     ),
     child: Wrap(alignment: WrapAlignment.spaceAround, runSpacing: 4, children: [
       if (landscape) ...[
-        CameraIconControl(icon: Icons.flash_on_outlined,
-          title: _videoMode ? '라이트' : '플래시', onPressed: _cycleFlash),
+        CameraIconControl(icon: _flashIcon,
+          title: _videoMode ? '라이트 $_flashState' : '플래시 $_flashState',
+          onPressed: _cycleFlash),
         CameraIconControl(icon: Icons.aspect_ratio_outlined,
           title: _ratio, onPressed: _cycleRatio),
+        CameraIconControl(icon: _timer == 0
+            ? Icons.timer_off_outlined : Icons.timer_outlined,
+          title: _timer == 0 ? '타이머 OFF' : '$_timer초',
+          onPressed: _cycleTimer),
       ],
-      CameraIconControl(icon: Icons.timer_outlined,
-        title: _timer == 0 ? '타이머 OFF' : '$_timer초',
-        onPressed: _cycleTimer),
       CameraIconControl(icon: _settings.showGrid ? Icons.grid_on : Icons.grid_off,
         title: '그리드', active: _settings.showGrid,
         onPressed: () => unawaited(_toggleGrid())),
@@ -1012,7 +1099,6 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     if (_cameraTransition || _recording || _recordingBusy || _busy) return;
     setState(() {
       _advancedVisible = false;
-      _zoomSliderVisible = false;
     });
     showModalBottomSheet<void>(
       context: context,
@@ -1084,10 +1170,132 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       ])),
   );
 
+  Future<void> _chooseLens(LensChoice selected) async {
+    if (!_ready || _cameraTransition || _recording || _recordingBusy || _busy) return;
+    if (_camera.currentLens?.id == selected.id) return;
+    _timerCancelled = true;
+    final epoch = ++_cameraEpoch;
+    setState(() {
+      _cameraTransition = true;
+      _cameraStatus = '${selected.title} 렌즈 연결 중';
+      _cameraError = null;
+      _ready = false;
+    });
+    try {
+      // Detach the previous CameraPreview from the widget tree before
+      // reopening another exact Camera2 camera ID.
+      await WidgetsBinding.instance.endOfFrame;
+      if (_pageDisposed || _background || epoch != _cameraEpoch) return;
+      await _camera.selectLens(selected.id);
+      if (_pageDisposed || _background || epoch != _cameraEpoch) return;
+      _syncZoom();
+      _flash = FlashMode.off;
+      debugPrint('[PhysicalLens] UI switched to camera ID ${selected.id}');
+    } catch (e) {
+      if (!_background) _message('렌즈 전환 실패: $e');
+    } finally {
+      if (mounted && epoch == _cameraEpoch) {
+        setState(() {
+          _cameraTransition = false;
+          _ready = !_background &&
+              (_camera.controller?.value.isInitialized ?? false);
+          if (!_ready && !_background) _cameraError = '카메라 재연결에 실패했어요.';
+        });
+      }
+    }
+  }
+
+  void _openLensPicker() {
+    if (!_ready || _cameraTransition || _busy || _recording || _recordingBusy) return;
+    final catalog = _camera.lensCatalog;
+    final choices = catalog?.choices ?? const <LensChoice>[];
+    if (choices.isEmpty) {
+      _message('사용 가능한 카메라를 찾지 못했어요.');
+      return;
+    }
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: CameraPalette.panel,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18))),
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(sheetContext).height * .72),
+          child: ListView(shrinkWrap: true, padding: const EdgeInsets.fromLTRB(14, 14, 14, 20),
+            children: [
+              const Center(child: Text('렌즈 선택', style: TextStyle(
+                fontSize: 16, fontWeight: FontWeight.w700,
+                color: CameraPalette.cream))),
+              const SizedBox(height: 7),
+              Text(catalog?.device ?? '', textAlign: TextAlign.center,
+                style: const TextStyle(color: CameraPalette.muted, fontSize: 11)),
+              const SizedBox(height: 12),
+              ...choices.map((lens) => ListTile(
+                dense: true,
+                leading: Icon(lens.direction == CameraLensDirection.front
+                    ? Icons.face : Icons.camera_outlined,
+                    color: CameraPalette.brass),
+                title: Text(lens.title,
+                    style: const TextStyle(color: CameraPalette.cream)),
+                subtitle: Text(lens.details,
+                    style: const TextStyle(color: CameraPalette.muted, fontSize: 11)),
+                trailing: _camera.currentLens?.id == lens.id
+                    ? const Icon(Icons.check, color: CameraPalette.brass) : null,
+                onTap: () {
+                  Navigator.of(sheetContext).pop();
+                  unawaited(_chooseLens(lens));
+                },
+              )),
+              if (catalog != null && catalog.hidden.isNotEmpty) ...[
+                const Divider(color: CameraPalette.stroke),
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 9, horizontal: 8),
+                  child: Text('시스템이 감지했지만 직접 열 수 없는 센서',
+                    style: TextStyle(color: CameraPalette.muted, fontSize: 11))),
+                ...catalog.hidden.map((lens) => ListTile(
+                  dense: true,
+                  enabled: false,
+                  title: Text(lens.title),
+                  subtitle: Text(lens.details,
+                    style: const TextStyle(fontSize: 11)),
+                  trailing: const Icon(Icons.lock_outline, size: 16),
+                )),
+              ],
+              Padding(
+                padding: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+                child: Text(catalog?.engineMessage ?? '',
+                    style: const TextStyle(color: CameraPalette.muted, fontSize: 11)),
+              ),
+              const Padding(
+                padding: EdgeInsets.fromLTRB(8, 8, 8, 0),
+                child: Text('실제로 열 수 있는 카메라 ID만 선택 가능합니다. 확대 배율은 선택된 렌즈의 시야각을 기준으로 한 근삿값입니다.',
+                    style: TextStyle(color: CameraPalette.muted, fontSize: 11)),
+              ),
+              if (catalog != null) Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.copy_outlined, size: 16),
+                  label: const Text('렌즈 진단 결과 복사'),
+                  onPressed: () {
+                    Clipboard.setData(ClipboardData(text: catalog.diagnostics()));
+                    Navigator.of(sheetContext).pop();
+                    _message('렌즈 목록을 복사했어요. 필요하면 보내주세요.');
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _shutterRow() => Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
     CameraIconControl(icon: Icons.photo_library_outlined, title: '앨범', onPressed: _openGallery),
     _shutter(),
-    CameraIconControl(icon: Icons.cameraswitch_outlined, title: '렌즈', onPressed: _switchCamera),
+    CameraIconControl(icon: Icons.camera_outlined, title: '렌즈', onPressed: _openLensPicker),
   ]);
 
   Widget _lookButton() => InkWell(
@@ -1114,12 +1322,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   Widget _controls(bool landscape) {
     if (landscape) {
-      return Container(width: 235, color: CameraPalette.panel,
+      return Container(width: 235, color: CameraPalette.base,
         child: SingleChildScrollView(child: Column(children: [
           _topBar(landscape: true),
           if (_advancedVisible) Padding(padding: const EdgeInsets.all(7),
             child: _advancedControls(landscape: true)),
           const SizedBox(height: 8),
+          _zoomControl(),
           _lookButton(),
           const SizedBox(height: 6),
           _modeSwitcher(),
@@ -1130,9 +1339,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       );
     }
     return Container(
-      color: CameraPalette.panel,
-      padding: const EdgeInsets.only(top: 1, bottom: 3),
+      color: CameraPalette.base,
+      padding: const EdgeInsets.only(top: 0, bottom: 3),
       child: Column(mainAxisSize: MainAxisSize.min, children: [
+        _zoomControl(),
         Center(child: _lookButton()),
         _modeSwitcher(),
         _shutterRow(),
@@ -1194,7 +1404,7 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
             Positioned(top: 8, right: 8,
               child: _advancedControls()),
           if (_pendingSaves > 0 || _processingVideos > 0)
-            Positioned(bottom: 9, left: 12, child: IgnorePointer(child: Container(
+            Positioned(bottom: 12, left: 12, child: IgnorePointer(child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
               decoration: BoxDecoration(color: CameraPalette.panel.withValues(alpha: .9),
                 border: Border.all(color: CameraPalette.stroke),

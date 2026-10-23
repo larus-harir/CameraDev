@@ -1,17 +1,20 @@
-# flutter_application_1
+# 무제 (미정)
 
-A new Flutter project.
+### 프로젝트 소개
 
-## Getting Started
+Flutter를 이용한 개인 카메라 앱 개발 프로젝트.
 
-This project is a starting point for a Flutter application.
+디지털카메라와 필름카메라의 느낌을 스마트폰에서도 사용해 보고 싶어서 시작했다.
 
-A few resources to get you started if this is your first Flutter project:
+사진과 동영상 촬영, 색감 필터, 프리셋 등의 기능을 구현했고, 추후 디자인이나 세부 기능들을 조금씩 개선해 나갈 예정이다.
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+### 개발 환경
+- Flutter / Dart
+- Android (추후 iOS)
+- VS Code
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+### 기타
+
+첫 번째 바이브 코딩 프로젝트.
+
+AI의 도움을 받아 직접 구상하고 개발하면서, 이것저것 시도해 보는 중이다.

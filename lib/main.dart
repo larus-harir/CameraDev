@@ -1,9 +1,26 @@
 import 'package:flutter/material.dart';
+import 'dart:io';
+import 'package:camera_android/camera_android.dart';
+import 'package:flutter/services.dart';
 import 'screens/camera_screen.dart';
 import 'widgets/camera_chrome.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // CameraX's camera enumeration may hide independently openable lenses.
+  // On Android, explicitly opt in to Flutter's Camera2 backend so that a
+  // CameraDescription with a Camera2 ID opens that exact native camera ID.
+  if (Platform.isAndroid) AndroidCamera.registerWith();
+  // Render the dark camera body behind the Android gesture/navigation area.
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Colors.transparent,
+    systemNavigationBarDividerColor: Colors.transparent,
+    systemNavigationBarIconBrightness: Brightness.light,
+    systemNavigationBarContrastEnforced: false,
+  ));
   runApp(const VintageCameraApp());
 }
 

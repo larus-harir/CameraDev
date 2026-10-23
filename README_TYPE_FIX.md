@@ -1,1 +1,0 @@
-CH.4 v1.1: Fix num-to-int Dart argument type errors in lib/services/filter_service.dart (image coordinates, copyResize width, sampling coordinates, film frame layout). Preserve all other files from v1. Execute flutter analyze and flutter run on your local Flutter installation to validate.

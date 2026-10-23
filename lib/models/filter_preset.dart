@@ -21,8 +21,11 @@ class CameraFilters {
     1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0,
   ];
   static const presets = myCameraPresets;
+  // Keep Original available internally for unfiltered source exports.
+  static const original = FilterPreset(id: 'original', label: 'Original');
   static const digitalPresets = digitalCameraProfiles;
   static FilterPreset byId(String id) {
+    if (id == 'original') return original;
     for (final preset in digitalPresets) {
       if (preset.id == id) return preset;
     }

@@ -5,6 +5,10 @@ import 'package:image/image.dart' as img;
 import '../models/filter_preset.dart';
 
 class FilterService {
+  // Edited JPEGs are capped to limit costly full-resolution Dart pixel loops.
+  // Change to 0 to retain sensor resolution (substantially slower on phones).
+  static const int maxEditedLongEdge = 3000;
+
   Future<Uint8List> processCapture(Uint8List jpeg, String ratio,
       FilterPreset preset, double strength, {Uint8List? frameArtwork}) => compute(_processJpeg, <Object?>[
     jpeg, ratio, CameraFilters.mixedMatrix(preset,strength), preset, strength, frameArtwork,
@@ -43,6 +47,19 @@ Uint8List _processJpeg(List<Object?> args) {
     }
   }
   if(!filtered && !needsCrop && frameArtwork == null && decoded.exif.imageIfd.orientation==null){return source;}
+  // A full sensor capture may exceed 12–48 MP. Reducing edited-only exports
+  // before the CPU pixel pass dramatically cuts both processing time and RAM.
+  // Unmodified JPEGs still use the original camera bytes unchanged.
+  const maxLongEdge = FilterService.maxEditedLongEdge;
+  if (maxLongEdge > 0 && math.max(image.width, image.height) > maxLongEdge) {
+    if (image.width >= image.height) {
+      image = img.copyResize(image, width: maxLongEdge,
+          interpolation: img.Interpolation.linear);
+    } else {
+      image = img.copyResize(image, height: maxLongEdge,
+          interpolation: img.Interpolation.linear);
+    }
+  }
   if(filtered){
     final highlights=preset.highlights.clamp(-100,100)*strength/100;
     final shadows=preset.shadows.clamp(-100,100)*strength/100;
@@ -117,5 +134,5 @@ Uint8List _processJpeg(List<Object?> args) {
         interpolation: img.Interpolation.linear);
     img.compositeImage(image, resized);
   }
-  return Uint8List.fromList(img.encodeJpg(image,quality:95));
+  return Uint8List.fromList(img.encodeJpg(image,quality:91));
 }

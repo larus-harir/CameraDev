@@ -11,8 +11,8 @@ class CameraSettings {
     this.askBeforeSaving = false,
     this.showGrid = false,
     this.saveOriginalAlongsideFilter = false,
-    this.addFilmFrameToExports = true,
-    this.addDigitalFrameToExports = true,
+    this.addFilmFrameToExports = false,
+    this.addDigitalFrameToExports = false,
   });
 
   CameraSettings copyWith({

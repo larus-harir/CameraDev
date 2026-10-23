@@ -2,12 +2,17 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart' show Offset;
 import 'package:flutter/foundation.dart' show debugPrint;
+import 'lens_catalog.dart';
 
 /// Serializes operations which replace or close the native camera. In particular,
 /// the permission dialog / app lifecycle must not race a mode switch.
 class CameraService {
   CameraController? controller;
   List<CameraDescription> cameras = [];
+  LensCatalog? lensCatalog;
+  LensChoice? get currentLens => cameras.isEmpty ? null :
+      lensCatalog?.forId(cameras[currentCameraIndex].name);
+  double get opticalFactor => currentLens?.opticalFactor ?? 1.0;
   int currentCameraIndex = 0;
   double minZoom = 1.0;
   double maxZoom = 1.0;
@@ -33,14 +38,23 @@ class CameraService {
         if (controller?.value.isInitialized ?? false) return;
         if (cameras.isEmpty) {
           cameras = await availableCameras();
-          cameras.sort((a, b) {
-            int priority(CameraDescription c) {
-              if (c.lensDirection == CameraLensDirection.back) return 0;
-              if (c.lensDirection == CameraLensDirection.front) return 1;
-              return 2;
-            }
-            return priority(a).compareTo(priority(b));
-          });
+          debugPrint('[CameraLens] Camera2 descriptions: '
+              '${cameras.map((c) => '${c.name}/${c.lensDirection.name}').join(', ')}');
+          lensCatalog = await LensCatalog.detect(cameras);
+          final priority = <String, int>{};
+          final ordered = lensCatalog!.choices;
+          for (var i = 0; i < ordered.length; i++) {
+            priority[ordered[i].id] = i;
+          }
+          cameras.sort((a, b) =>
+              (priority[a.name] ?? 999).compareTo(priority[b.name] ?? 999));
+          // On launch, use the true wide/1x lens rather than selecting
+          // ultrawide simply because its native camera ID sorts first.
+          final defaultIndex = cameras.indexWhere((c) =>
+              c.lensDirection == CameraLensDirection.back &&
+              (lensCatalog?.forId(c.name)?.opticalFactor ?? 1) >= .83 &&
+              (lensCatalog?.forId(c.name)?.opticalFactor ?? 1) <= 1.55);
+          currentCameraIndex = defaultIndex >= 0 ? defaultIndex : 0;
         }
         if (cameras.isEmpty) throw StateError('사용 가능한 카메라가 없습니다.');
         if (currentCameraIndex >= cameras.length) currentCameraIndex = 0;
@@ -52,7 +66,7 @@ class CameraService {
     controller = null;
     if (previous != null) await previous.dispose();
 
-    // An Android permission dialog or a newly disposed CameraX preview surface
+    // An Android permission dialog or a newly disposed native preview surface
     // can briefly leave the Flutter surface producer unavailable. Retry ONLY
     // that known transient failure, recreating the controller each time.
     for (var attempt = 0; attempt < 3; attempt++) {
@@ -60,7 +74,10 @@ class CameraService {
       try {
         next = CameraController(
           cameras[currentCameraIndex],
-          videoMode ? ResolutionPreset.high : ResolutionPreset.max,
+          // Avoid very large sensor JPEGs (sometimes 48 MP+) that delay the
+          // shutter and then get resized by our edited-JPEG pipeline anyway.
+          // Switch ultraHigh to max for maximum full-resolution originals.
+          videoMode ? ResolutionPreset.high : ResolutionPreset.ultraHigh,
           enableAudio: videoMode && microphoneEnabled,
           imageFormatGroup: ImageFormatGroup.jpeg,
         );
@@ -70,6 +87,9 @@ class CameraService {
         await next.setZoomLevel(1.0.clamp(minimum, maximum).toDouble());
         minZoom = minimum;
         maxZoom = maximum;
+        debugPrint('[CameraLens] Active camera=${cameras[currentCameraIndex].name}, '
+            'minZoom=$minimum, maxZoom=$maximum. '
+            'Camera2 camera ID is opened directly; optical multiplier=$opticalFactor.');
         controller = next;
         return;
       } catch (error) {
@@ -81,7 +101,7 @@ class CameraService {
           }
         }
         final detail = error.toString();
-        debugPrint('CameraX initialization attempt ${attempt + 1} failed: $detail');
+        debugPrint('Camera initialization attempt ${attempt + 1} failed: $detail');
         final transientSurfaceError =
             detail.contains('surfaceProducerHandlesCropAndRotation') ||
             detail.contains('flutterSurfaceProducer');
@@ -118,6 +138,35 @@ class CameraService {
         currentCameraIndex =
             index >= 0 ? index : (currentCameraIndex + 1) % cameras.length;
         await _startCurrentCamera();
+      });
+
+
+  /// Open the exact Camera2 ID verified by the platform inventory.
+  /// A logical-only physical ID is deliberately rejected.
+  Future<void> selectLens(String cameraId) => _exclusive(() async {
+        if (controller?.value.isRecordingVideo ?? false) {
+          throw StateError('녹화 중에는 렌즈를 바꿀 수 없습니다.');
+        }
+        final targetIndex = cameras.indexWhere((c) => c.name == cameraId);
+        final selected = lensCatalog?.forId(cameraId);
+        if (targetIndex < 0 || selected == null || !selected.openable) {
+          throw StateError('이 렌즈는 현재 카메라 엔진에서 직접 열 수 없습니다 (ID $cameraId).');
+        }
+        if (targetIndex == currentCameraIndex && (controller?.value.isInitialized ?? false)) {
+          return;
+        }
+        final oldIndex = currentCameraIndex;
+        currentCameraIndex = targetIndex;
+        try {
+          await _startCurrentCamera();
+          debugPrint('[PhysicalLens] SELECTED opened Camera2 id=$cameraId '
+              'factor=${selected.opticalFactor.toStringAsFixed(2)}');
+        } catch (e) {
+          debugPrint('[PhysicalLens] switch failed for $cameraId: $e');
+          currentCameraIndex = oldIndex;
+          try { await _startCurrentCamera(); } catch (_) {}
+          rethrow;
+        }
       });
 
   Future<void> startVideo() => _exclusive(() async {

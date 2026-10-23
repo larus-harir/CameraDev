@@ -35,7 +35,7 @@ class SettingsService {
       style: prefs.getString('cameraStyle') == 'film'
           ? CameraStyle.film : CameraStyle.digital,
       digitalId: prefs.getString('digitalFilterId') ?? 'digital_s',
-      filmId: prefs.getString('filmFilterId') ?? prefs.getString('filterId') ?? 'original',
+      filmId: prefs.getString('filmFilterId') ?? prefs.getString('filterId') ?? 'preset_01',
       digitalStrength: (prefs.getDouble('digitalStrength') ?? 1.0).clamp(0.0, 1.0).toDouble(),
       filmStrength: (prefs.getDouble('filmStrength') ?? prefs.getDouble('filterStrength') ?? 1.0).clamp(0.0, 1.0).toDouble(),
     );

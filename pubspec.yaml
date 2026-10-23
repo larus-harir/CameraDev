@@ -10,6 +10,9 @@ dependencies:
   flutter:
     sdk: flutter
   camera: ^0.12.1
+  camera_android: ^0.10.12
+  physical_lens_bridge:
+    path: packages/physical_lens_bridge
   shared_preferences: ^2.5.3
   gal: ^2.3.0
   photo_manager: ^3.6.4

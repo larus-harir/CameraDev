@@ -17,7 +17,7 @@ class _FilterEditorScreenState extends State<FilterEditorScreen> {
   final _filter = FilterService();
   final _storage = PhotoStorageService();
   Uint8List? _sourceBytes;
-  String _id = 'original';
+  String _id = 'preset_01';
   double _strength = 1.0;
   bool _saving = false;
 

@@ -61,13 +61,13 @@ class VideoFilterService {
     }
     final command = overlayPath == null
         ? '-hide_banner -loglevel error -y -i ${quote(input)} '
-          '-vf ${quote(vf)} -map 0:v:0 -map 0:a? -c:v libx264 -preset veryfast '
-          '-crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ${quote(output)}'
+          '-vf ${quote(vf)} -map 0:v:0 -map 0:a? -c:v libx264 -preset superfast '
+          '-crf 22 -pix_fmt yuv420p -c:a copy ${quote(output)}'
         : '-hide_banner -loglevel error -y -i ${quote(input)} -loop 1 -i ${quote(overlayPath)} '
           '-filter_complex ${quote('[0:v]$vf[base];[1:v][base]scale2ref=w=main_w:h=main_h[ov][scaled];'
               '[scaled][ov]overlay=x=0:y=0:shortest=1,format=yuv420p[out]')} '
-          '-map [out] -map 0:a? -c:v libx264 -preset veryfast '
-          '-crf 20 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart ${quote(output)}';
+          '-map [out] -map 0:a? -c:v libx264 -preset superfast '
+          '-crf 22 -pix_fmt yuv420p -c:a copy ${quote(output)}';
     try {
       final session = await FFmpegKit.execute(command);
       final result = await session.getReturnCode();

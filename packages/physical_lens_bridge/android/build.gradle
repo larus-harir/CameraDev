@@ -1,0 +1,16 @@
+group 'dev.kcw.physical_lens_bridge'
+version '0.1.0'
+
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'dev.kcw.physical_lens_bridge'
+    compileSdk 36
+    defaultConfig {
+        minSdk 24
+    }
+}
+
+dependencies {
+    implementation 'androidx.annotation:annotation:1.9.1'
+}

@@ -51,17 +51,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
               value: settings.saveOriginalAlongsideFilter,
               onChanged: (v) => update(settings.copyWith(saveOriginalAlongsideFilter: v)),
             ),
-            SwitchListTile(
-              title: const Text('디카 화면 표시를 결과물에도 저장'),
-              subtitle: const Text('디카 모드의 날짜·모서리 표시·색감 정보를 사진 및 동영상에 넣습니다. 원본 동시 저장 파일에는 적용하지 않습니다.'),
-              value: settings.addDigitalFrameToExports,
-              onChanged: (v) => update(settings.copyWith(addDigitalFrameToExports: v)),
-            ),
-            SwitchListTile(
-              title: const Text('필카 프레임을 결과물에도 저장'),
-              subtitle: const Text('필카 모드에서 촬영한 사진·동영상에 절제된 필름 게이트 테두리를 적용합니다. 원본 동시 저장 파일에는 적용하지 않습니다.'),
-              value: settings.addFilmFrameToExports,
-              onChanged: (v) => update(settings.copyWith(addFilmFrameToExports: v)),
+            const ListTile(
+              leading: Icon(Icons.layers_outlined),
+              title: Text('디카 / 필카 프레임'),
+              subtitle: Text('디자인 재작업 중 · 현재 미리보기와 저장본 모두 프레임 없음. 프레임 저장 기능 코드는 유지됩니다.'),
+              enabled: false,
             ),
             const Divider(),
             const _Header('촬영 화면'),

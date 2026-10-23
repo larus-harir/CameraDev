@@ -1,0 +1,16 @@
+name: physical_lens_bridge
+description: Android Camera2 camera/lens inventory for accurate physical camera selection.
+version: 0.1.0
+publish_to: none
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.22.0'
+dependencies:
+  flutter:
+    sdk: flutter
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.kcw.physical_lens_bridge
+        pluginClass: PhysicalLensBridgePlugin

@@ -1,0 +1,31 @@
+name: vintage_camera
+description: A customizable camera app with gallery, aspect ratio, and level.
+publish_to: 'none'
+version: 1.0.0+2
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.12.1
+  camera_android: ^0.10.12
+  physical_lens_bridge:
+    path: packages/physical_lens_bridge
+  shared_preferences: ^2.5.3
+  gal: ^2.3.0
+  photo_manager: ^3.6.4
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  image: ^4.5.4
+  video_player: ^2.9.5
+  ffmpeg_kit_flutter_new: ^4.6.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
